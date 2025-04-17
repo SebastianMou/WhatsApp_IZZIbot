@@ -1,5 +1,6 @@
 from openai import OpenAI
 from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
 from dotenv import load_dotenv
 from flask import Flask, request
 import os
@@ -25,7 +26,7 @@ conversation_history = {}
 # Dictionary to track which conversations are in manual mode
 manual_mode = {}
 
-# NEW: Dictionary to track if first message has been sent to each user
+# Dictionary to track if first message has been sent to each user
 first_message_sent = {}
 
 # === IMAGE DICTIONARY START ===
@@ -34,14 +35,6 @@ image_library = {
         "description": "Paquete de 60MB con promoción 3 meses",
         "url": "https://tinyurl.com/ABR-2025-IZZI"
     },
-    "3P 200MB promo": {
-        "description": "Paquete 3P con 200MB y Apple TV+ incluido",
-        "url": "https://tinyurl.com/IZZI-3P-200MB"
-    },
-    "coverage map": {
-        "description": "Mapa de cobertura IZZI",
-        "url": "https://tinyurl.com/IZZI-Cobertura"
-    }
     # Puedes agregar más imágenes aquí
 }
 
@@ -54,7 +47,7 @@ SECRET_KEYWORD = "CONTROL123"  # Cambia esto a tu palabra clave secreta
 # File to persist conversation history
 HISTORY_FILE = "conversation_history.json"
 MANUAL_MODE_FILE = "manual_mode.json"
-FIRST_MESSAGE_FILE = "first_message_sent.json"  # NEW: File to track first message status
+FIRST_MESSAGE_FILE = "first_message_sent.json"
 
 # Load existing conversation history from file if it exists
 def load_conversation_history():
@@ -66,7 +59,7 @@ def load_conversation_history():
         if os.path.exists(MANUAL_MODE_FILE):
             with open(MANUAL_MODE_FILE, 'r') as file:
                 manual_mode = json.load(file)
-        if os.path.exists(FIRST_MESSAGE_FILE):  # NEW: Load first message status
+        if os.path.exists(FIRST_MESSAGE_FILE):
             with open(FIRST_MESSAGE_FILE, 'r') as file:
                 first_message_sent = json.load(file)
     except Exception as e:
@@ -82,10 +75,24 @@ def save_data():
             json.dump(conversation_history, file)
         with open(MANUAL_MODE_FILE, 'w') as file:
             json.dump(manual_mode, file)
-        with open(FIRST_MESSAGE_FILE, 'w') as file:  # NEW: Save first message status
+        with open(FIRST_MESSAGE_FILE, 'w') as file:
             json.dump(first_message_sent, file)
     except Exception as e:
         print(f"Error saving data: {e}")
+
+# Safe function to send messages that won't crash your server
+def safe_send_message(to, body):
+    try:
+        message = twilio_client.messages.create(
+            from_='whatsapp:+14155238886',
+            body=body,
+            to=to
+        )
+        return True
+    except TwilioRestException as e:
+        # Just log the error but don't crash
+        print(f"Twilio error sending to {to}: {str(e)}")
+        return False
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -93,43 +100,33 @@ logger = logging.getLogger(__name__)
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    # Get incoming message
+    # Get basic information
     incoming_msg = request.values.get('Body', '').strip()
     sender = request.values.get('From', '')
     
+    # SIMPLIFIED: Just check if there's any indication of a location or media
+    if not incoming_msg:
+        media_count = request.values.get('NumMedia', '0')
+        if media_count != '0' or 'MediaUrl' in request.values or 'Latitude' in request.values:
+            # Don't process details, just mark as a location
+            incoming_msg = "[UBICACIÓN COMPARTIDA]"
+    
     # Check if this is the secret keyword to toggle manual mode
     if incoming_msg == SECRET_KEYWORD:
-        print(f"Secret keyword detected from {sender}!")
         # Toggle manual mode for this conversation
         if sender in manual_mode:
             manual_mode[sender] = not manual_mode.get(sender, False)
         else:
             manual_mode[sender] = True
         
-        # Notify you that manual mode has been toggled
-        notification_msg = f"Manual mode {'ACTIVATED' if manual_mode.get(sender, False) else 'DEACTIVATED'} for {sender}"
-        twilio_client.messages.create(
-            from_='whatsapp:+14155238886',
-            body=notification_msg,
-            to=YOUR_PHONE_NUMBER
-        )
-        
-        # Save the updated manual mode status
+        # Don't send any notification message - just save status
         save_data()
-        
-        # Don't respond to the user for the secret keyword
         return "Mode changed"
     
     # If in manual mode, forward this message to you
     if manual_mode.get(sender, False):
         # Forward the message to you
-        twilio_client.messages.create(
-            from_='whatsapp:+14155238886',
-            body=f"Message from {sender}: {incoming_msg}",
-            to=YOUR_PHONE_NUMBER
-        )
-        
-        # Add a route to handle your responses
+        safe_send_message(YOUR_PHONE_NUMBER, f"Message from {sender}: {incoming_msg}")
         return "Message forwarded"
     
     # Normal bot mode - continue with existing logic
@@ -165,15 +162,23 @@ def webhook():
            - Pídele específicamente que comparta su ubicación en tiempo real usando la función de mapa de WhatsApp
            - Explica que esto es necesario para verificar la cobertura con precisión
            - Dile cómo compartir su ubicación: "Por favor, presiona el clip (📎) y selecciona 'Ubicación' para compartir tu ubicación actual"
-        3. Identifica sus necesidades (velocidad, tipo de uso, número de dispositivos, etc).
-        4. Ofrece el paquete más adecuado con precio específico y explica beneficios.
-        5. Solicita documentación: INE y comprobante domicilio.
-        6. Explica verificación por WhatsApp y código.
+        3. Cuando recibas un mensaje que dice [UBICACIÓN COMPARTIDA], confirma que has recibido la ubicación y agradece al usuario por compartirla.
+           Dile que verificarás la cobertura en esa ubicación exacta.
+        4. Identifica sus necesidades (velocidad, tipo de uso, número de dispositivos, etc).
+        5. Ofrece el paquete más adecuado con precio específico y explica beneficios.
+        6. Solicita documentación: INE y comprobante domicilio.
+        7. Explica verificación por WhatsApp y código.
 
         ### Ejemplos de respuestas
 
-        **Pregunta sobre cobertura:**
-        "¿En qué colonia vives? Verifico si tenemos cobertura ahí. Asegúrate de que el usuario lo envíe por WhatsApp usando la función de mapa para obtener coordenadas precisas."
+        **Primer mensaje al iniciar conversación:**
+        "¡Hola! 👋 ¿Actualmente tienes contratado algún servicio de internet en casa?"
+
+        **Solicitud de ubicación por WhatsApp:**
+        "Para verificar la cobertura exacta en tu zona, ¿podrías compartirme tu ubicación usando el mapa de WhatsApp? Solo presiona el clip (📎), selecciona 'Ubicación' y envíame tu ubicación actual. 📍"
+
+        **Confirmación de ubicación recibida:**
+        "¡Gracias por compartir tu ubicación! 👍 Ahora verificaré si tenemos cobertura exacta en esa zona."
 
         **Pregunta sobre precios:**
         "Tenemos internet desde $399 (40 megas) por 3 meses. El más popular es 60 megas a $469 con internet ilimitado. ¿Qué velocidad necesitas?"
@@ -183,12 +188,23 @@ def webhook():
 
         ### Restricciones
         - No ofrecer servicios fuera de paquetes oficiales
-        - Verificar cobertura antes de prometer instalación
+        - SIEMPRE verificar cobertura mediante la ubicación exacta del mapa de WhatsApp
+        - No aceptar solo nombres de colonias o calles, INSISTIR en la ubicación por mapa
         - No compartir precios incorrectos
         - No crear promociones no autorizadas
+        
+        ### Instrucciones CRÍTICAS sobre ubicación
+        - SIEMPRE debes pedir la ubicación por WhatsApp después de confirmar si tienen servicio de internet
+        - Explica claramente cómo compartir la ubicación (usando el clip y seleccionando "Ubicación")
+        - Si el cliente no sabe cómo compartir su ubicación, dale instrucciones paso a paso:
+          1. Presiona el ícono de clip (📎) en la parte inferior de la pantalla
+          2. Selecciona "Ubicación" de las opciones
+          3. Elige "Ubicación actual" para compartir dónde estás ahora mismo
+        - Si el cliente insiste en solo dar el nombre de una colonia, explica amablemente que necesitas la ubicación exacta por mapa para verificar cobertura con precisión
+        - Cuando recibas un mensaje con [UBICACIÓN COMPARTIDA], significa que el usuario ha compartido su ubicación real. Debes confirmar que la recibiste y agradecerle.
     """
     
-    # NEW: Check if this is a new user or first message
+    # Check if this is a new user or first message
     is_new_user = sender not in conversation_history
     is_first_message = not first_message_sent.get(sender, False)
     
@@ -196,7 +212,7 @@ def webhook():
     if is_new_user:
         conversation_history[sender] = [{"role": "system", "content": system_instruction}]
     
-    # NEW: If this is the first message from this user, respond with the specific question
+    # If this is the first message from this user, respond with the specific question
     if is_first_message:
         # Mark that we've sent the first message to this user
         first_message_sent[sender] = True
@@ -213,12 +229,8 @@ def webhook():
         # Save updated conversation history
         save_data()
         
-        # Send the fixed first response
-        message = twilio_client.messages.create(
-            from_='whatsapp:+14155238886',
-            body=first_response,
-            to=sender
-        )
+        # Send the fixed first response using safe method
+        safe_send_message(sender, first_response)
         
         return "First message sent"
     
@@ -229,14 +241,6 @@ def webhook():
     if len(conversation_history[sender]) > 21:  # 1 system message + 20 conversation messages
         conversation_history[sender] = [conversation_history[sender][0]] + conversation_history[sender][-20:]
     
-    logger.info(f"Conversation with {sender}")
-    for msg in conversation_history[sender]:
-        role = msg["role"]
-        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-        logger.info(f"  {role}: {content_preview}")
-    
-    logger.info("Sending request to OpenAI API...")
-
     # Get AI response using the conversation history
     response = openai_client.chat.completions.create(
         model="gpt-4o",
@@ -245,15 +249,17 @@ def webhook():
     
     ai_response = response.choices[0].message.content
 
+    # Special handling for location acknowledgment
+    if incoming_msg == "[UBICACIÓN COMPARTIDA]" and not "gracias" in ai_response.lower():
+        ai_response = "¡Gracias por compartir tu ubicación! 👍 Verificaré si tenemos cobertura en esa zona exacta. " + ai_response
+
+    # Check for keywords to add images (only if they appear in the message)
     keywords = ["60mb", "200mb", "apple tv", "cobertura"]
     for key, data in image_library.items():
-        print("AI Response:", ai_response)
         for kw in keywords:
             if kw in ai_response.lower():
                 ai_response += f"\n\n📸 {data['description']}:\n{data['url']}"
                 break
-
-    logger.info(f"  assistant response: {ai_response[:100]}..." if len(ai_response) > 100 else ai_response)
 
     # Add AI response to conversation history
     conversation_history[sender].append({"role": "assistant", "content": ai_response})
@@ -261,12 +267,8 @@ def webhook():
     # Save updated conversation history
     save_data()
     
-    # Send AI response back via WhatsApp
-    message = twilio_client.messages.create(
-        from_='whatsapp:+14155238886',
-        body=ai_response,
-        to=sender
-    )
+    # Send AI response back via WhatsApp using safe method
+    safe_send_message(sender, ai_response)
     
     return "Message sent"
 
@@ -277,14 +279,10 @@ def send_manual():
     recipient = request.form.get('recipient')
     message_text = request.form.get('message')
     
-    # Send your response to the user
-    twilio_client.messages.create(
-        from_='whatsapp:+14155238886',
-        body=message_text,
-        to=recipient
-    )
+    # Send your response to the user using safe method
+    success = safe_send_message(recipient, message_text)
     
-    return "Manual message sent"
+    return "Manual message sent" if success else "Failed to send manual message"
 
 # In newer Flask versions, we handle initialization differently
 with app.app_context():
