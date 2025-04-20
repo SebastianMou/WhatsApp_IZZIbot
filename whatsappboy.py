@@ -2,52 +2,58 @@ from openai import OpenAI
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import os
 import json
 import logging
+import threading
+import time
 
 load_dotenv()
 
-# Set up OpenAI client
 openai_client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
-# Set up Twilio client
 account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
 auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
 twilio_client = Client(account_sid, auth_token)
 
-# Flask app for webhook
 app = Flask(__name__)
 
-# Dictionary to store conversation history for each user
 conversation_history = {}
 
-# Dictionary to track which conversations are in manual mode
 manual_mode = {}
 
-# Dictionary to track if first message has been sent to each user
 first_message_sent = {}
 
-# === IMAGE DICTIONARY START ===
+last_message_time = {}
+
+pending_responses = {}
+
+DEBUG_MODE = True
+
 image_library = {
-    "2P 60MB promo": {
-        "description": "Paquete de 60MB con promoción 3 meses",
-        "url": "https://tinyurl.com/ABR-2025-IZZI"
+    "paquetes_principales": {
+        "description": "Paquetes principales IZZI (2P y 3P)",
+        "url": "https://tinyurl.com/3bcdnps4" 
     },
-    # Puedes agregar más imágenes aquí
+    "promociones_adicionales": {
+        "description": "Todas las promociones y paquetes adicionales",
+        "url": "https://tinyurl.com/ABR-2025-IZZI"
+    }
 }
 
-# Your phone number to receive notifications
-YOUR_PHONE_NUMBER = 'whatsapp:+527445055734'  # Reemplaza con tu número de WhatsApp
-
-# Secret keyword to toggle manual mode
-SECRET_KEYWORD = "CONTROL123"  # Cambia esto a tu palabra clave secreta
+SECRET_KEYWORD = "CONTROL123" 
 
 # File to persist conversation history
 HISTORY_FILE = "conversation_history.json"
 MANUAL_MODE_FILE = "manual_mode.json"
 FIRST_MESSAGE_FILE = "first_message_sent.json"
+
+RESPONSE_DELAY = 10
+
+def debug_print(msg):
+    if DEBUG_MODE:
+        print(f"DEBUG: {msg}")
 
 # Load existing conversation history from file if it exists
 def load_conversation_history():
@@ -56,6 +62,7 @@ def load_conversation_history():
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, 'r') as file:
                 conversation_history = json.load(file)
+            debug_print(f"Loaded conversation history for {len(conversation_history)} users")
         if os.path.exists(MANUAL_MODE_FILE):
             with open(MANUAL_MODE_FILE, 'r') as file:
                 manual_mode = json.load(file)
@@ -63,7 +70,7 @@ def load_conversation_history():
             with open(FIRST_MESSAGE_FILE, 'r') as file:
                 first_message_sent = json.load(file)
     except Exception as e:
-        print(f"Error loading data: {e}")
+        debug_print(f"Error loading data: {e}")
         conversation_history = {}
         manual_mode = {}
         first_message_sent = {}
@@ -77,140 +84,154 @@ def save_data():
             json.dump(manual_mode, file)
         with open(FIRST_MESSAGE_FILE, 'w') as file:
             json.dump(first_message_sent, file)
+        debug_print("Data saved successfully")
     except Exception as e:
-        print(f"Error saving data: {e}")
+        debug_print(f"Error saving data: {e}")
 
 # Safe function to send messages that won't crash your server
 def safe_send_message(to, body):
+    debug_print(f"Attempting to send message to {to}: {body[:50]}...")
     try:
         message = twilio_client.messages.create(
             from_='whatsapp:+14155238886',
             body=body,
             to=to
         )
-        return True
+        debug_print(f"Message sent successfully to {to}")
+        return True, message.sid
     except TwilioRestException as e:
-        # Just log the error but don't crash
-        print(f"Twilio error sending to {to}: {str(e)}")
-        return False
+        debug_print(f"Twilio error sending to {to}: {str(e)}")
+        return False, str(e)
+    except Exception as e:
+        debug_print(f"Unexpected error sending to {to}: {str(e)}")
+        return False, str(e)
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+def get_system_instruction():
+    return """
+    ## Instrucciones Chatbot Ventas IZZI
 
-@app.route("/webhook", methods=['POST'])
-def webhook():
-    # Get basic information
-    incoming_msg = request.values.get('Body', '').strip()
-    sender = request.values.get('From', '')
-    
-    # SIMPLIFIED: Just check if there's any indication of a location or media
-    if not incoming_msg:
-        media_count = request.values.get('NumMedia', '0')
-        if media_count != '0' or 'MediaUrl' in request.values or 'Latitude' in request.values:
-            # Don't process details, just mark as a location
-            incoming_msg = "[UBICACIÓN COMPARTIDA]"
-    
-    # Check if this is the secret keyword to toggle manual mode
-    if incoming_msg == SECRET_KEYWORD:
-        # Toggle manual mode for this conversation
-        if sender in manual_mode:
-            manual_mode[sender] = not manual_mode.get(sender, False)
-        else:
-            manual_mode[sender] = True
-        
-        # Don't send any notification message - just save status
-        save_data()
-        return "Mode changed"
-    
-    # If in manual mode, forward this message to you
-    if manual_mode.get(sender, False):
-        # Forward the message to you
-        safe_send_message(YOUR_PHONE_NUMBER, f"Message from {sender}: {incoming_msg}")
-        return "Message forwarded"
-    
-    # Normal bot mode - continue with existing logic
-    
-    # System instruction for AI
-    system_instruction = """
-        ## Instrucciones Chatbot Ventas IZZI
+    ### Identidad
+    - Eres un asesor de internet amigable y conversacional llamado Sebastian Mauricio.
+    - Tu objetivo es vender servicios IZZI por WhatsApp de forma natural y efectiva.
 
-        ### Identidad
-        - Eres un asesor de internet amigable y conversacional llamado Sebastian Mauricio.
-        - Tu objetivo es vender servicios IZZI por WhatsApp de forma natural y efectiva.
+    ### Estilo de comunicación
+    - Mensajes cortos (1-3 oraciones máximo).
+    - Tono casual y humano, nunca robótico.
+    - Usa 1-2 emojis ocasionales (no en cada mensaje).
+    - Evita listas, viñetas o formatos complejos.
 
-        ### Estilo de comunicación
-        - Mensajes cortos (1-3 oraciones máximo).
-        - Tono casual y humano, nunca robótico.
-        - Usa 1-2 emojis ocasionales (no en cada mensaje).
-        - Evita listas, viñetas o formatos complejos.
+    ### Paquetes principales
+    - **2P (3 meses promoción):** 40MB $399, 60MB $469, 80MB $489, 150MB $559, 200MB $619
+    - **3P (6 meses promoción):** 40MB $549, 60MB $649, 80MB $669, 150MB $739, 200MB $799
 
-        ### Paquetes principales
-        - **2P (3 meses promoción):** 40MB $399, 60MB $469, 80MB $489, 150MB $559, 200MB $619
-        - **3P (6 meses promoción):** 40MB $549, 60MB $649, 80MB $669, 150MB $739, 200MB $799
+    ### Promociones importantes
+    - Instalación GRATIS
+    - MAX gratis por 12 meses (activar primeros 3 meses)
+    - Apple TV+ incluido en paquetes 200MB+
+    - Domizzilia: $50 descuento mensual de por vida
+    - Sin plazos forzosos disponible (seguro de exención)
 
-        ### Promociones importantes
-        - Instalación GRATIS
-        - MAX gratis por 12 meses (activar primeros 3 meses)
-        - Apple TV+ incluido en paquetes 200MB+
-        - Domizzilia: $50 descuento mensual de por vida
-        - Sin plazos forzosos disponible (seguro de exención)
+    ### Proceso de venta
+    1. Saluda de forma casual y pregunta si actualmente tiene algún servicio de internet contratado.
+    2. Si responde, DEBES solicitar su ubicación EXACTA usando el mapa de WhatsApp:
+       - Pídele específicamente que comparta su ubicación en tiempo real usando la función de mapa de WhatsApp
+       - Explica que esto es necesario para verificar la cobertura con precisión
+       - Dile cómo compartir su ubicación: "Por favor, presiona el clip (📎) y selecciona 'Ubicación' para compartir tu ubicación actual"
+    3. Cuando recibas un mensaje que dice [UBICACIÓN COMPARTIDA], confirma que has recibido la ubicación y agradece al usuario por compartirla.
+    4. DESPUÉS de recibir la ubicación, DEBES hacer más preguntas para entender sus necesidades:
+       - ¿Cuántos dispositivos conectarán al internet?
+       - ¿Qué tipo de uso le darán? (streaming, videollamadas, juegos, trabajo desde casa, etc.)
+       - ¿Cuántas personas usarán el servicio?
+       - ¿Tienen un presupuesto específico en mente?
+       - ¿Les interesa algún servicio adicional como TV o streaming?
+    5. Basado en toda esta información, recomienda el paquete más adecuado con su precio específico y beneficios.
+    6. IMPORTANTE: Cuando el cliente acepte un paquete específico y esté listo para proceder, NO solicites documentación.
+       En su lugar, envía el siguiente mensaje EXACTO y luego termina la conversación:
+       "¡Perfecto! Déjame verificar la cobertura exacta en tu zona. Dame un momento mientras confirmo la disponibilidad del servicio... ⏳"
+       
+    ### REGLA CRÍTICA PARA TERMINAR LA CONVERSACIÓN
+    - NUNCA pidas INE, comprobante de domicilio o información personal
+    - Cuando el cliente acepte un paquete específico, ÚNICAMENTE envía el mensaje sobre verificar cobertura
+    - NO continúes la conversación después de enviar ese mensaje
+    - NO pidas documentación
+    - NO hables sobre códigos de verificación
+    - NO expliques siguientes pasos o procesos
 
-        ### Proceso de venta
-        1. Saluda de forma casual y pregunta si actualmente tiene algún servicio de internet contratado.
-        2. Si responde, DEBES solicitar su ubicación EXACTA usando el mapa de WhatsApp:
-           - Pídele específicamente que comparta su ubicación en tiempo real usando la función de mapa de WhatsApp
-           - Explica que esto es necesario para verificar la cobertura con precisión
-           - Dile cómo compartir su ubicación: "Por favor, presiona el clip (📎) y selecciona 'Ubicación' para compartir tu ubicación actual"
-        3. Cuando recibas un mensaje que dice [UBICACIÓN COMPARTIDA], confirma que has recibido la ubicación y agradece al usuario por compartirla.
-           Dile que verificarás la cobertura en esa ubicación exacta.
-        4. Identifica sus necesidades (velocidad, tipo de uso, número de dispositivos, etc).
-        5. Ofrece el paquete más adecuado con precio específico y explica beneficios.
-        6. Solicita documentación: INE y comprobante domicilio.
-        7. Explica verificación por WhatsApp y código.
+    ### Ejemplos de respuestas
 
-        ### Ejemplos de respuestas
+    **Primer mensaje al iniciar conversación:**
+    "¡Hola! 👋 ¿Actualmente cuentas con una compañía o servicio de internet?"
 
-        **Primer mensaje al iniciar conversación:**
-        "¡Hola! 👋 ¿Actualmente tienes contratado algún servicio de internet en casa?"
+    **Solicitud de ubicación por WhatsApp:**
+    "Para verificar la cobertura exacta en tu zona, ¿podrías compartirme tu ubicación usando el mapa de WhatsApp? Solo presiona el clip (📎), selecciona 'Ubicación' y envíame tu ubicación actual. 📍"
 
-        **Solicitud de ubicación por WhatsApp:**
-        "Para verificar la cobertura exacta en tu zona, ¿podrías compartirme tu ubicación usando el mapa de WhatsApp? Solo presiona el clip (📎), selecciona 'Ubicación' y envíame tu ubicación actual. 📍"
+    **Confirmación de ubicación recibida:**
+    "¡Gracias por compartir tu ubicación! 👍 Ahora verificaré si tenemos cobertura exacta en esa zona. ¿Cuántos dispositivos conectarás al internet?"
 
-        **Confirmación de ubicación recibida:**
-        "¡Gracias por compartir tu ubicación! 👍 Ahora verificaré si tenemos cobertura exacta en esa zona."
+    **Pregunta sobre precios:**
+    "Tenemos internet desde $399 (40 megas) por 3 meses. El más popular es 60 megas a $469 con internet ilimitado. ¿Qué velocidad necesitas?"
 
-        **Pregunta sobre precios:**
-        "Tenemos internet desde $399 (40 megas) por 3 meses. El más popular es 60 megas a $469 con internet ilimitado. ¿Qué velocidad necesitas?"
+    **Cuando el cliente acepta un paquete:**
+    "¡Perfecto! Déjame verificar la cobertura exacta en tu zona. Dame un momento mientras confirmo la disponibilidad del servicio... ⏳"
+    [NO ENVÍES MÁS MENSAJES DESPUÉS DE ESTO]
 
-        **Para cerrar venta:**
-        "¡Perfecto! Para avanzar, envíame tu INE y comprobante de domicilio al 55 2401 6069. Luego te daré un código para confirmar."
-
-        ### Restricciones
-        - No ofrecer servicios fuera de paquetes oficiales
-        - SIEMPRE verificar cobertura mediante la ubicación exacta del mapa de WhatsApp
-        - No aceptar solo nombres de colonias o calles, INSISTIR en la ubicación por mapa
-        - No compartir precios incorrectos
-        - No crear promociones no autorizadas
-        
-        ### Instrucciones CRÍTICAS sobre ubicación
-        - SIEMPRE debes pedir la ubicación por WhatsApp después de confirmar si tienen servicio de internet
-        - Explica claramente cómo compartir la ubicación (usando el clip y seleccionando "Ubicación")
-        - Si el cliente no sabe cómo compartir su ubicación, dale instrucciones paso a paso:
-          1. Presiona el ícono de clip (📎) en la parte inferior de la pantalla
-          2. Selecciona "Ubicación" de las opciones
-          3. Elige "Ubicación actual" para compartir dónde estás ahora mismo
-        - Si el cliente insiste en solo dar el nombre de una colonia, explica amablemente que necesitas la ubicación exacta por mapa para verificar cobertura con precisión
-        - Cuando recibas un mensaje con [UBICACIÓN COMPARTIDA], significa que el usuario ha compartido su ubicación real. Debes confirmar que la recibiste y agradecerle.
+    ### Restricciones
+    - No ofrecer servicios fuera de paquetes oficiales
+    - SIEMPRE verificar cobertura mediante la ubicación exacta del mapa de WhatsApp
+    - No aceptar solo nombres de colonias o calles, INSISTIR en la ubicación por mapa
+    - No compartir precios incorrectos
+    - No crear promociones no autorizadas
+    - NUNCA solicitar documentación personal (INE, comprobante de domicilio)
+    - DETENER la conversación después del mensaje de verificación de cobertura
     """
+
+# Define add_image_if_needed outside the delayed_response function
+def add_image_if_needed(ai_response, is_first_message=False):
+    """Add at most one image to the response based on content or if it's the first message"""
     
-    # Check if this is a new user or first message
-    is_new_user = sender not in conversation_history
+    # Check if we're explicitly discussing packages/prices
+    discussing_packages = any(term in ai_response.lower() for term in [
+        "paquete", "precio", "costo", "tarifa", "megas", 
+        "internet", "velocidad", "mb", "plan", "oferta", "promoción"
+    ])
+    
+    # Add image only in specific situations:
+    # 1. First message from the bot after location is shared
+    # 2. When specifically discussing packages/prices AND the user is asking about them
+    if is_first_message or (discussing_packages and not "ya te compartí" in ai_response.lower()):
+        # Don't send the same image twice in a short period
+        data = image_library["paquetes_principales"]
+        # Only add if the image URL isn't already in the response
+        if data['url'] not in ai_response:
+            ai_response += f"\n\n📸 {data['description']}:\n{data['url']}"
+    
+    return ai_response
+
+def delayed_response(sender, incoming_msg):
+    global last_message_time, pending_responses, conversation_history, first_message_sent
+    
+    debug_print(f"Starting delayed response for {sender}, will wait {RESPONSE_DELAY} seconds")
+    
+    # Sleep for the configured delay time
+    time.sleep(RESPONSE_DELAY)
+    
+    # After waiting, check if we received any new messages during the delay
+    current_time = time.time()
+    if sender in last_message_time and (current_time - last_message_time[sender]) < RESPONSE_DELAY:
+        debug_print(f"Aborting response to older message from {sender} - newer message received")
+        return
+    
+    debug_print(f"Processing delayed response for {sender} after waiting")
+    
+    # Make sure the conversation exists for this sender
+    if sender not in conversation_history:
+        # Initialize with system instruction
+        conversation_history[sender] = [{"role": "system", "content": get_system_instruction()}]
+        debug_print(f"Initialized new conversation for {sender}")
+    
+    # Check if this is the first message
     is_first_message = not first_message_sent.get(sender, False)
-    
-    # Initialize conversation for new users
-    if is_new_user:
-        conversation_history[sender] = [{"role": "system", "content": system_instruction}]
+    debug_print(f"Is first message for {sender}? {is_first_message}")
     
     # If this is the first message from this user, respond with the specific question
     if is_first_message:
@@ -219,9 +240,7 @@ def webhook():
         
         # Standard first message to always ask
         first_response = "¡Hola! 👋 ¿Actualmente cuenta con una compañía o servicio de internet?"
-        
-        # Add user message to conversation history
-        conversation_history[sender].append({"role": "user", "content": incoming_msg})
+        debug_print(f"Sending first message to {sender}: {first_response}")
         
         # Add our fixed first response to conversation history
         conversation_history[sender].append({"role": "assistant", "content": first_response})
@@ -230,63 +249,199 @@ def webhook():
         save_data()
         
         # Send the fixed first response using safe method
-        safe_send_message(sender, first_response)
+        success, result = safe_send_message(sender, first_response)
+        debug_print(f"First message sent result: {success}, {result}")
         
-        return "First message sent"
+        # Clear this sender from pending responses
+        if sender in pending_responses:
+            del pending_responses[sender]
+            
+        return
     
-    # Add user message to conversation history
-    conversation_history[sender].append({"role": "user", "content": incoming_msg})
-    
-    # Limit conversation history to prevent token limit issues (keep last 20 messages)
-    if len(conversation_history[sender]) > 21:  # 1 system message + 20 conversation messages
-        conversation_history[sender] = [conversation_history[sender][0]] + conversation_history[sender][-20:]
+    # Not first message, generate AI response
+    debug_print(f"Generating AI response for {sender}")
     
     # Get AI response using the conversation history
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=conversation_history[sender]
-    )
-    
-    ai_response = response.choices[0].message.content
+    try:
+        debug_print(f"Sending request to OpenAI with conversation history of {len(conversation_history[sender])} messages")
+        
+        # Print last few messages for context
+        for i, msg in enumerate(conversation_history[sender][-3:]):
+            debug_print(f"  Message {i}: {msg['role']} - {msg['content'][:50]}...")
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=conversation_history[sender]
+        )
+        
+        ai_response = response.choices[0].message.content
+        debug_print(f"Got AI response: {ai_response[:100]}...")
 
-    # Special handling for location acknowledgment
-    if incoming_msg == "[UBICACIÓN COMPARTIDA]" and not "gracias" in ai_response.lower():
-        ai_response = "¡Gracias por compartir tu ubicación! 👍 Verificaré si tenemos cobertura en esa zona exacta. " + ai_response
+        # Special handling for location acknowledgment
+        if "[UBICACIÓN COMPARTIDA]" in incoming_msg and not "gracias" in ai_response.lower():
+            debug_print("Adding location acknowledgment to response")
+            ai_response = "¡Gracias por compartir tu ubicación! 👍 Verificaré si tenemos cobertura en esa zona exacta. " + ai_response
 
-    # Check for keywords to add images (only if they appear in the message)
-    keywords = ["60mb", "200mb", "apple tv", "cobertura"]
-    for key, data in image_library.items():
-        for kw in keywords:
-            if kw in ai_response.lower():
-                ai_response += f"\n\n📸 {data['description']}:\n{data['url']}"
+
+        # Add this check in your delayed_response function after generating the AI response:
+        if "déjame verificar la cobertura exacta" in ai_response.lower() and "dame un momento" in ai_response.lower():
+            # Switch to manual mode after sending this message
+            manual_mode[sender] = True
+            debug_print(f"Automatically switched to manual mode for {sender} after coverage verification message")
+            save_data()
+
+        # Check if we've recently sent an image to this user
+        last_few_messages = conversation_history[sender][-3:]  # Get last 3 messages
+        recently_sent_image = False
+        for msg in last_few_messages:
+            if msg.get("role") == "assistant" and any(img['url'] in msg.get("content", "") for img in image_library.values()):
+                recently_sent_image = True
                 break
 
-    # Add AI response to conversation history
-    conversation_history[sender].append({"role": "assistant", "content": ai_response})
+        # Only add image if we haven't recently sent one
+        if not recently_sent_image:
+            ai_response = add_image_if_needed(ai_response, is_first_message)
+        else:
+            # Skip adding an image if we recently sent one
+            debug_print("Skipping image - recently sent one")
+        
+        # Add AI response to conversation history
+        conversation_history[sender].append({"role": "assistant", "content": ai_response})
+        save_data()
+        
+        # Actually send the message to the user
+        debug_print(f"Sending AI response to {sender}: {ai_response[:50]}...")
+        success, result = safe_send_message(sender, ai_response)
+        debug_print(f"AI response sent result: {success}, {result}")
+        
+    except Exception as e:
+        debug_print(f"Error generating response: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Save updated conversation history
-    save_data()
-    
-    # Send AI response back via WhatsApp using safe method
-    safe_send_message(sender, ai_response)
-    
-    return "Message sent"
+    # Clear this sender from pending responses
+    if sender in pending_responses:
+        del pending_responses[sender]
+        debug_print(f"Cleared pending response for {sender}")
 
-# Add a new route to handle your responses to forwarded messages
-@app.route("/send_manual", methods=['POST'])
-def send_manual():
-    # This endpoint would be called from a simple web interface where you can respond
-    recipient = request.form.get('recipient')
-    message_text = request.form.get('message')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@app.route("/webhook", methods=['POST'])
+def webhook():
+    global last_message_time, pending_responses, conversation_history
     
-    # Send your response to the user using safe method
-    success = safe_send_message(recipient, message_text)
-    
-    return "Manual message sent" if success else "Failed to send manual message"
+    try:
+        all_values = request.values.to_dict()
+        debug_print(f"RECEIVED REQUEST: {all_values}")
+        
+        incoming_msg = request.values.get('Body', '').strip()
+        sender = request.values.get('From', '')
+        
+        debug_print(f"Received message from {sender}: {incoming_msg}")
+        
+        last_message_time[sender] = time.time()
+        
+        if not incoming_msg:
+            media_count = request.values.get('NumMedia', '0')
+            if media_count != '0' or 'MediaUrl' in request.values or 'Latitude' in request.values:
+                # Don't process details, just mark as a location
+                incoming_msg = "[UBICACIÓN COMPARTIDA]"
+                debug_print("Detected location or media content")
+        
+        # Check if this is the secret keyword to toggle manual mode
+        if incoming_msg == SECRET_KEYWORD:
+            debug_print(f"Secret keyword detected from {sender}")
+            # Toggle manual mode for this conversation
+            if sender in manual_mode:
+                manual_mode[sender] = not manual_mode.get(sender, False)
+            else:
+                manual_mode[sender] = True
+            
+            debug_print(f"Manual mode for {sender} set to {manual_mode.get(sender, False)}")
+            
+            # Cancel any pending response for this sender
+            if sender in pending_responses:
+                del pending_responses[sender]
+            
+            # Don't send any notification message - just save status
+            save_data()
+            return "Mode changed"
+        
+        # If in manual mode, forward this message to you
+        if manual_mode.get(sender, False):
+            debug_print(f"User {sender} is in manual mode, message will not be processed")
+            
+            # Cancel any pending response for this sender
+            if sender in pending_responses:
+                del pending_responses[sender]
+                
+            return "Message received in manual mode"
+        
+        # Make sure the conversation exists for this sender
+        if sender not in conversation_history:
+            # Initialize with system instruction
+            debug_print(f"Initializing new conversation for {sender}")
+            conversation_history[sender] = [{"role": "system", "content": get_system_instruction()}]
+        
+        # Add user message to conversation history
+        debug_print(f"Adding user message to conversation history for {sender}")
+        conversation_history[sender].append({"role": "user", "content": incoming_msg})
+        
+        # Limit conversation history to prevent token limit issues (keep last 20 messages)
+        if len(conversation_history[sender]) > 21:  # 1 system message + 20 conversation messages
+            conversation_history[sender] = [conversation_history[sender][0]] + conversation_history[sender][-20:]
+            debug_print(f"Trimmed conversation history for {sender} to 21 messages")
+        
+        # Save the updated conversation history
+        save_data()
+        
+        # Cancel any existing pending response for this user
+        if sender in pending_responses:
+            debug_print(f"Cancelling pending response for {sender} - new message received")
+            # We don't actually need to cancel the thread - it will check the message time and cancel itself
+        
+        # Start a new delayed response thread
+        debug_print(f"Starting new response thread for {sender}")
+        response_thread = threading.Thread(target=delayed_response, args=(sender, incoming_msg))
+        response_thread.daemon = True  # Make sure thread doesn't prevent app from exiting
+        response_thread.start()
+        
+        # Store the thread reference
+        pending_responses[sender] = response_thread
+        
+        return "Message received, will respond after delay"
+        
+    except Exception as e:
+        debug_print(f"Error in webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return "Error processing request", 500
+
+# Add a debug route to view current state
+@app.route("/debug", methods=['GET'])
+def debug_state():
+    return jsonify({
+        "conversation_count": len(conversation_history),
+        "manual_mode_count": len(manual_mode),
+        "first_message_sent_count": len(first_message_sent),
+        "pending_responses_count": len(pending_responses),
+        "twilio_account_sid": account_sid[-4:] if account_sid else "None",
+        "has_twilio_auth": bool(auth_token),
+        "has_openai_key": bool(os.environ.get('OPENAI_API_KEY')),
+        "response_delay": RESPONSE_DELAY
+    })
+
+# Add a status route to check the server
+@app.route("/status", methods=['GET'])
+def status():
+    return "Bot is running"
 
 # In newer Flask versions, we handle initialization differently
 with app.app_context():
     load_conversation_history()
+    debug_print("Application initialized and ready")
 
 if __name__ == "__main__":
+    debug_print("Starting server on port 7000")
     app.run(debug=True, port=7000)
