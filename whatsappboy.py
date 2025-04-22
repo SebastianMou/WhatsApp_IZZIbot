@@ -44,7 +44,6 @@ image_library = {
 
 SECRET_KEYWORD = "CONTROL123" 
 
-# File to persist conversation history
 HISTORY_FILE = "conversation_history.json"
 MANUAL_MODE_FILE = "manual_mode.json"
 FIRST_MESSAGE_FILE = "first_message_sent.json"
@@ -121,8 +120,8 @@ def get_system_instruction():
     - Evita listas, viñetas o formatos complejos.
 
     ### Paquetes principales
-    - **2P (3 meses promoción):** 40MB $399, 60MB $469, 80MB $489, 150MB $559, 200MB $619
-    - **3P (6 meses promoción):** 40MB $549, 60MB $649, 80MB $669, 150MB $739, 200MB $799
+    - **2P (3 meses promoción):** 40MB (+60MB adicionales) $349, 60MB (+80MB adicionales) $419, 80MB (+100MB adicionales) $439, 150MB (+200MB adicionales) $509, 200MB (+500MB adicionales) $569, 500MB (+1000MB adicionales) $689, 1000MB $889
+    - **3P (6 meses promoción):** 40MB (+60MB adicionales) $499, 60MB (+80MB adicionales) $599, 80MB (+100MB adicionales) $619, 150MB (+200MB adicionales) $689, 200MB (+500MB adicionales) $749, 500MB (+1000MB adicionales) $869, 1000MB $1,069
 
     ### Promociones importantes
     - Instalación GRATIS
@@ -344,15 +343,39 @@ def webhook():
         
         if not incoming_msg:
             media_count = request.values.get('NumMedia', '0')
-            if media_count != '0' or 'MediaUrl' in request.values or 'Latitude' in request.values:
-                # Don't process details, just mark as a location
+            media_content_type = request.values.get('MediaContentType0', '')
+            
+            # Check specifically for audio messages
+            if 'audio' in media_content_type.lower():
+                # Mark as voice message
+                incoming_msg = "[AUDIO_MESSAGE]"
+                debug_print("Detected voice message")
+            # Check for location
+            elif 'Latitude' in request.values:
                 incoming_msg = "[UBICACIÓN COMPARTIDA]"
-                debug_print("Detected location or media content")
+                debug_print("Detected location share")
+            # Any other media
+            elif media_count != '0' or 'MediaUrl' in request.values:
+                incoming_msg = "[MEDIA_CONTENT]"
+                debug_print("Detected other media content")
         
-        # Check if this is the secret keyword to toggle manual mode
+        if "[AUDIO_MESSAGE]" in incoming_msg:
+            debug_print("Adding voice message response")
+            ai_response = "Disculpa, estoy en un lugar con mucho ruido y no puedo escuchar bien los mensajes de voz. ¿Podrías enviarme tu consulta por texto? Así podré ayudarte mejor. 😊"
+            
+            conversation_history[sender].append({"role": "assistant", "content": ai_response})
+            save_data()
+            
+            success, result = safe_send_message(sender, ai_response)
+            debug_print(f"Voice message response sent result: {success}, {result}")
+            
+            if sender in pending_responses:
+                del pending_responses[sender]
+                
+            return "Audio message handled"
+
         if incoming_msg == SECRET_KEYWORD:
             debug_print(f"Secret keyword detected from {sender}")
-            # Toggle manual mode for this conversation
             if sender in manual_mode:
                 manual_mode[sender] = not manual_mode.get(sender, False)
             else:
@@ -360,35 +383,27 @@ def webhook():
             
             debug_print(f"Manual mode for {sender} set to {manual_mode.get(sender, False)}")
             
-            # Cancel any pending response for this sender
             if sender in pending_responses:
                 del pending_responses[sender]
             
-            # Don't send any notification message - just save status
             save_data()
             return "Mode changed"
-        
-        # If in manual mode, forward this message to you
+         
         if manual_mode.get(sender, False):
             debug_print(f"User {sender} is in manual mode, message will not be processed")
             
-            # Cancel any pending response for this sender
             if sender in pending_responses:
                 del pending_responses[sender]
                 
             return "Message received in manual mode"
         
-        # Make sure the conversation exists for this sender
         if sender not in conversation_history:
-            # Initialize with system instruction
             debug_print(f"Initializing new conversation for {sender}")
             conversation_history[sender] = [{"role": "system", "content": get_system_instruction()}]
         
-        # Add user message to conversation history
         debug_print(f"Adding user message to conversation history for {sender}")
         conversation_history[sender].append({"role": "user", "content": incoming_msg})
         
-        # Limit conversation history to prevent token limit issues (keep last 20 messages)
         if len(conversation_history[sender]) > 21:  # 1 system message + 20 conversation messages
             conversation_history[sender] = [conversation_history[sender][0]] + conversation_history[sender][-20:]
             debug_print(f"Trimmed conversation history for {sender} to 21 messages")
@@ -418,7 +433,6 @@ def webhook():
         traceback.print_exc()
         return "Error processing request", 500
 
-# Add a debug route to view current state
 @app.route("/debug", methods=['GET'])
 def debug_state():
     return jsonify({
@@ -432,12 +446,10 @@ def debug_state():
         "response_delay": RESPONSE_DELAY
     })
 
-# Add a status route to check the server
 @app.route("/status", methods=['GET'])
 def status():
     return "Bot is running"
 
-# In newer Flask versions, we handle initialization differently
 with app.app_context():
     load_conversation_history()
     debug_print("Application initialized and ready")
