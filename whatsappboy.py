@@ -42,7 +42,8 @@ image_library = {
     }
 }
 
-SECRET_KEYWORD = "CONTROL123" 
+SECRET_KEYWORD = "/-"
+RESUME_KEYWORD = "/--"
 
 HISTORY_FILE = "conversation_history.json"
 MANUAL_MODE_FILE = "manual_mode.json"
@@ -261,6 +262,7 @@ def delayed_response(sender, incoming_msg):
     debug_print(f"Generating AI response for {sender}")
     
     # Get AI response using the conversation history
+    # Get AI response using the conversation history
     try:
         debug_print(f"Sending request to OpenAI with conversation history of {len(conversation_history[sender])} messages")
         
@@ -268,9 +270,19 @@ def delayed_response(sender, incoming_msg):
         for i, msg in enumerate(conversation_history[sender][-3:]):
             debug_print(f"  Message {i}: {msg['role']} - {msg['content'][:50]}...")
         
+        # If this message is resuming from manual mode, add a system instruction to analyze the conversation
+        messages_to_send = conversation_history[sender].copy()
+        if incoming_msg == "AI assistance resumed":
+            debug_print("Adding instruction to analyze conversation after manual mode")
+            analyze_instruction = {
+                "role": "system", 
+                "content": "The conversation was temporarily in manual mode (handled by a human). Review the recent messages and provide an appropriate response that acknowledges any questions or issues raised during that time."
+            }
+            messages_to_send.append(analyze_instruction)
+        
         response = openai_client.chat.completions.create(
             model="gpt-4o",
-            messages=conversation_history[sender]
+            messages=messages_to_send
         )
         
         ai_response = response.choices[0].message.content
@@ -388,6 +400,23 @@ def webhook():
             
             save_data()
             return "Mode changed"
+        elif incoming_msg == RESUME_KEYWORD:
+            debug_print(f"Resume keyword detected from {sender}")
+            if sender in manual_mode and manual_mode[sender]:
+                manual_mode[sender] = False
+                debug_print(f"Manual mode disabled for {sender}, AI will resume")
+                
+                # Start a delayed response to allow AI to analyze the conversation and respond
+                response_thread = threading.Thread(target=delayed_response, args=(sender, "AI assistance resumed"))
+                response_thread.daemon = True
+                response_thread.start()
+                
+                # Store the thread reference
+                pending_responses[sender] = response_thread
+                
+                save_data()
+                return "AI assistance resumed"
+            return "Not in manual mode"
          
         if manual_mode.get(sender, False):
             debug_print(f"User {sender} is in manual mode, message will not be processed")
