@@ -93,7 +93,7 @@ def safe_send_message(to, body):
     debug_print(f"Attempting to send message to {to}: {body[:50]}...")
     try:
         message = twilio_client.messages.create(
-            from_='whatsapp:+5274458564815',
+            from_='whatsapp:+527445856415',
             body=body,
             to=to
         )
